@@ -1,14 +1,17 @@
 from models import utils as mutils
 import torch
+import torch.nn as nn
 import numpy as np
 from sampling import NoneCorrector, NonePredictor, shared_corrector_update_fn, shared_predictor_update_fn
 import functools
+import time
 
 
 def get_pc_inpainter(sde, predictor, corrector, inverse_scaler, snr,
                      n_steps=1, probability_flow=False, continuous=False,
                      denoise=True, eps=1e-5):
   """Create an image inpainting function that uses PC samplers.
+
 
   Args:
     sde: An `sde_lib.SDE` object that represents the forward SDE.
@@ -179,3 +182,198 @@ def get_pc_colorizer(sde, predictor, corrector, inverse_scaler,
       return inverse_scaler(x_mean if denoise else x)
 
   return pc_colorizer
+
+
+
+def get_mixture_conditional_sampler(sde,
+                               predictor, corrector, inverse_scaler, snr,
+                               n_steps=1, probability_flow=False,
+                               continuous=False, denoise=True, eps=1e-5,M=1):
+  """Class-conditional sampling with Predictor-Corrector (PC) samplers.
+  Args:
+    sde: An `sde_lib.SDE` object that represents the forward SDE.
+    score_model: A `flax.linen.Module` object that represents the architecture of the score-based model.
+    classifier: A `flax.linen.Module` object that represents the architecture of the noise-dependent classifier.
+    classifier_params: A dictionary that contains the weights of the classifier.
+    shape: A sequence of integers. The expected shape of a single sample.
+    predictor: A subclass of `sampling.predictor` that represents a predictor algorithm.
+    corrector: A subclass of `sampling.corrector` that represents a corrector algorithm.
+    inverse_scaler: The inverse data normalizer.
+    snr: A `float` number. The signal-to-noise ratio for correctors.
+    n_steps: An integer. The number of corrector steps per update of the predictor.
+    probability_flow: If `True`, solve the probability flow ODE for sampling with the predictor.
+    continuous: `True` indicates the score-based model was trained with continuous time.
+    denoise: If `True`, add one-step denoising to final samples.
+    eps: A `float` number. The SDE/ODE will be integrated to `eps` to avoid numerical issues.
+  Returns: A pmapped class-conditional image sampler.
+  """
+  # A function that gives the logits of the noise-dependent classifier
+  #logit_fn = mutils.get_logit_fn(classifier, classifier_params)
+  # The gradient function of the noise-dependent classifier
+  #@torch.enable_grad()
+  def mixture_grad_fn(x1t, x2t, ve_noise_scale, mixed):
+    lambda_ = 1./(ve_noise_scale**2)
+    lam = lambda_[0]
+    with torch.enable_grad():
+
+      x1n = x1t.clone().detach().requires_grad_(True)
+      x2n = x2t.clone().detach().requires_grad_(True)
+        
+      xs=[x1n,x2n]
+      recon_loss = (torch.norm(torch.flatten(sum(xs) - mixed)) ** 2)
+      recon_grads = torch.autograd.grad(recon_loss, xs)
+      mult = torch.einsum ('i, ijkl -> ijkl', lambda_, recon_grads[0])
+    
+    #mult = lam*(x1t + x2t - mixed)
+
+    return mult
+
+
+
+  #classifier_grad_fn = mutils.get_classifier_grad_fn(logit_fn)
+  #mixture_grad_fn = get_mixture_grad_fn(x1, x2, ve_noise_scale, mixed)
+
+  def conditional_predictor_update_fn(model, x1, x2, t, mixed):
+    """The predictor update function for class-conditional sampling."""
+    score_fn = mutils.get_score_fn(sde, model, train=False,
+                                   continuous=continuous)
+
+    
+
+    def total_grad_fn(x1, t):
+      ve_noise_scale = sde.marginal_prob(x1, t)[1]
+      #return score_fn(x, t) + classifier_grad_fn(x, ve_noise_scale, labels)
+      return score_fn(x1, t) - mixture_grad_fn(x1,x2, ve_noise_scale, mixed)
+
+
+    if predictor is None:
+      predictor_obj = NonePredictor(sde, total_grad_fn, probability_flow)
+    else:
+      predictor_obj = predictor(sde, total_grad_fn, probability_flow)
+    return predictor_obj.update_fn(x1, t)
+
+  def conditional_corrector_update_fn(model, x1t, x2t, t, mixed):
+    """The corrector update function for class-conditional sampling."""
+    score_fn = mutils.get_score_fn(sde, model, train=False,
+                                   continuous=continuous)
+
+    def total_grad_fn(x1t, t):
+      ve_noise_scale = sde.marginal_prob(x1t, t)[1]
+      return score_fn(x1t, t) - mixture_grad_fn(x1t, x2t, ve_noise_scale, mixed)
+
+    if corrector is None:
+      corrector_obj = NoneCorrector(sde, total_grad_fn, snr, n_steps)
+    else:
+      corrector_obj = corrector(sde, total_grad_fn, snr, n_steps)
+    return corrector_obj.update_fn(x1t, t)
+
+  def pc_mixture_sampler(model, mixture):
+    """Generate class-conditional samples with Predictor-Corrector (PC) samplers.
+    Args:
+      rng: A JAX random state.
+      score_state: A `flax.struct.dataclass` object that represents the training state
+        of the score-based model.
+      labels: A JAX array of integers that represent the target label of each sample.
+    Returns:
+      Class-conditional samples.
+    """
+    with torch.no_grad():
+      shape = mixture.shape
+      #mask = get_mask(gray_scale_img)
+      # Initial sample
+      x1 = sde.prior_sampling(shape).to(mixture.device)
+      x2 = sde.prior_sampling(shape).to(mixture.device)
+
+      #x1=nn.Parameter(torch.Tensor(shape).uniform_()).to(mixture.device)
+      #x2=nn.Parameter(torch.Tensor(shape).uniform_()).to(mixture.device)
+
+      timesteps = torch.linspace(sde.T, eps, sde.N)
+        
+      #Try sampling at only a fraction of the noise scales
+      #so that nsteps can be increased  
+       
+      for i,ts in enumerate(timesteps[::111]):
+      #for i in range(sde.N):
+        #t = timesteps[i]
+        #vec_t = torch.ones(x1.shape[0], device=x1.device) * t
+        vec_t = torch.ones(x1.shape[0], device=x1.device) * ts
+
+        #This does all updates for x1 at one noise scale, then all for x2.  Don't want that!
+        #x1c, x1_mean = conditional_corrector_update_fn(model, x1, x2, vec_t, mixture)
+        #x2c, x2_mean = conditional_corrector_update_fn(model, x2, x1, vec_t, mixture)
+        
+        #Keep n_steps=1 and do multiple steps in another loop
+        for i in range(M):
+          x1_0 = x1
+          x2_0 = x2
+          x1, x1_mean = conditional_corrector_update_fn(model, x1_0, x2_0, vec_t, mixture)
+          x2, x2_mean = conditional_corrector_update_fn(model, x2_0, x1_0, vec_t, mixture)
+          
+          #x1 = torch.clamp(x1, 0, 1)
+          #x2 = torch.clamp(x2, 0, 1)
+          #x1_mean = torch.clamp(x1_mean, 0, 1)
+          #x2_mean = torch.clamp(x2_mean, 0, 1)
+
+          #x1, x1_mean = conditional_predictor_update_fn(model, x1c, x2c, vec_t, mixture)
+          #x2, x2_mean = conditional_predictor_update_fn(model, x2c, x1c, vec_t, mixture)
+
+          #x1 = torch.clamp(x1, 0, 1)
+          #x2 = torch.clamp(x2, 0, 1)
+          #x1_mean = torch.clamp(x1_mean, 0, 1)
+          #x2_mean = torch.clamp(x2_mean, 0, 1)
+
+        #x1c = torch.clamp(x1c, 0, 1)
+        #x2c = torch.clamp(x2c, 0, 1)
+
+
+        x1c = x1
+        x2c = x2
+        x1, x1_mean = conditional_predictor_update_fn(model, x1c, x2c, vec_t, mixture)
+        x2, x2_mean = conditional_predictor_update_fn(model, x2c, x1c, vec_t, mixture)
+
+        #x1 = torch.clamp(x1, 0, 1)
+        #x1_mean = torch.clamp(x1_mean,0,1)
+        #x2 = torch.clamp(x2, 0, 1)
+        #x2_mean = torch.clamp(x2_mean,0,1)
+
+
+      return inverse_scaler(x1_mean if denoise else x1), inverse_scaler(x2_mean if denoise else x2)
+
+  return pc_mixture_sampler
+
+
+
+  '''
+  def pc_conditional_sampler(rng, score_state, labels):
+    """Generate class-conditional samples with Predictor-Corrector (PC) samplers.
+    Args:
+      rng: A JAX random state.
+      score_state: A `flax.struct.dataclass` object that represents the training state
+        of the score-based model.
+      labels: A JAX array of integers that represent the target label of each sample.
+    Returns:
+      Class-conditional samples.
+    """
+    # Initial sample
+    rng, step_rng = random.split(rng)
+    x = sde.prior_sampling(step_rng, shape)
+
+    timesteps = jnp.linspace(sde.T, eps, sde.N)
+
+    def loop_body(i, val):
+      rng, x, x_mean = val
+      t = timesteps[i]
+      vec_t = jnp.ones(shape[0]) * t
+      rng, step_rng = random.split(rng)
+      x, x_mean = conditional_corrector_update_fn(step_rng, score_state, x, vec_t, labels)
+      rng, step_rng = random.split(rng)
+      x, x_mean = conditional_predictor_update_fn(step_rng, score_state, x, vec_t, labels)
+      return rng, x, x_mean
+
+    _, x, x_mean = jax.lax.fori_loop(0, sde.N, loop_body, (rng, x, x))
+    return inverse_scaler(x_mean if denoise else x)
+
+  return jax.pmap(pc_conditional_sampler, axis_name='batch')
+
+
+  '''
