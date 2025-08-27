@@ -4,6 +4,6 @@ This repo is a fork of the score_sde_pytorch repo (described below) with the add
 
 ![ex1](assets/ex1.jpg)
 
-![ex2](assets/ex1.jpg)
+![ex2](assets/ex2.jpg)
 
-![ex3](assets/ex1.jpg)
+![ex3](assets/ex3.jpg)
