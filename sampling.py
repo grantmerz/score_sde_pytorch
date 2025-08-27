@@ -319,6 +319,45 @@ class AnnealedLangevinDynamics(Corrector):
     return x, x_mean
 
 
+@register_corrector(name='ald_old')
+class AnnealedLangevinDynamicsOld(Corrector):
+  """The original annealed Langevin dynamics predictor in NCSN/NCSNv2.
+
+  We include this corrector only for completeness. It was not directly used in our paper.
+  """
+
+  def __init__(self, sde, score_fn, snr, n_steps):
+    super().__init__(sde, score_fn, snr, n_steps)
+    if not isinstance(sde, sde_lib.VPSDE) \
+        and not isinstance(sde, sde_lib.VESDE) \
+        and not isinstance(sde, sde_lib.subVPSDE):
+      raise NotImplementedError(f"SDE class {sde.__class__.__name__} not yet supported.")
+
+  def update_fn(self, x, t):
+    sde = self.sde
+    score_fn = self.score_fn
+    n_steps = self.n_steps
+    target_snr = self.snr
+    if isinstance(sde, sde_lib.VPSDE) or isinstance(sde, sde_lib.subVPSDE):
+      timestep = (t * (sde.N - 1) / sde.T).long()
+      alpha = sde.alphas.to(t.device)[timestep]
+    else:
+      alpha = torch.ones_like(t)
+
+    std = self.sde.marginal_prob(x, t)[1]
+
+    for i in range(n_steps):
+      grad = score_fn(x, t)
+      noise = torch.randn_like(x)
+      #step_size = (target_snr * std) ** 2 * 2 * alpha
+      step_size = (std/0.01) ** 2 * 0.000008
+
+      x_mean = x + step_size[:, None, None, None] * grad
+      x = x_mean + noise * torch.sqrt(step_size * 2)[:, None, None, None]
+      x = x.type(torch.cuda.FloatTensor)
+      x_mean = x_mean.type(torch.cuda.FloatTensor)
+    return x, x_mean
+
 @register_corrector(name='none')
 class NoneCorrector(Corrector):
   """An empty corrector that does nothing."""
@@ -483,3 +522,74 @@ def get_ode_sampler(sde, shape, inverse_scaler,
       return x, nfe
 
   return ode_sampler
+
+
+
+def get_old_pc_sampler(sde, shape, predictor, corrector, inverse_scaler, snr,
+                   n_steps=1, probability_flow=False, continuous=False,
+                   denoise=True, eps=1e-3, device='cuda'):
+  """Create a Predictor-Corrector (PC) sampler.
+
+  Args:
+    sde: An `sde_lib.SDE` object representing the forward SDE.
+    shape: A sequence of integers. The expected shape of a single sample.
+    predictor: A subclass of `sampling.Predictor` representing the predictor algorithm.
+    corrector: A subclass of `sampling.Corrector` representing the corrector algorithm.
+    inverse_scaler: The inverse data normalizer.
+    snr: A `float` number. The signal-to-noise ratio for configuring correctors.
+    n_steps: An integer. The number of corrector steps per predictor update.
+    probability_flow: If `True`, solve the reverse-time probability flow ODE when running the predictor.
+    continuous: `True` indicates that the score model was continuously trained.
+    denoise: If `True`, add one-step denoising to the final samples.
+    eps: A `float` number. The reverse-time SDE and ODE are integrated to `epsilon` to avoid numerical issues.
+    device: PyTorch device.
+
+  Returns:
+    A sampling function that returns samples and the number of function evaluations during sampling.
+  """
+  # Create predictor & corrector update functions
+  predictor_update_fn = functools.partial(shared_predictor_update_fn,
+                                          sde=sde,
+                                          predictor=predictor,
+                                          probability_flow=probability_flow,
+                                          continuous=continuous)
+  corrector_update_fn = functools.partial(shared_corrector_update_fn,
+                                          sde=sde,
+                                          corrector=corrector,
+                                          continuous=continuous,
+                                          snr=snr,
+                                          n_steps=n_steps)
+
+  def pc_sampler(model):
+    """ The PC sampler funciton.
+
+    Args:
+      model: A score model.
+    Returns:
+      Samples, number of function evaluations.
+    """
+    with torch.no_grad():
+      # Initial sample
+      x = sde.prior_sampling(shape).to(device)
+      timesteps = torch.linspace(sde.T, eps, sde.N, device=device)
+
+      for i in range(sde.N):
+        t = timesteps[i]
+
+        #labels = torch.ones(1, device=device) * i
+        #labels = labels.long()
+        #labels = i
+        vec_t = torch.ones(shape[0], device=t.device) * t
+        x, x_mean = corrector_update_fn(x, vec_t, model=model)
+        
+        x = x.type(torch.cuda.FloatTensor)
+        x_mean = x_mean.type(torch.cuda.FloatTensor)
+        
+        #x, x_mean = predictor_update_fn(x, labels, model=model)
+        
+        #x = x.type(torch.cuda.FloatTensor)
+        #x_mean = x_mean.type(torch.cuda.FloatTensor)
+
+      return inverse_scaler(x_mean if denoise else x), sde.N * (n_steps + 1)
+
+  return pc_sampler

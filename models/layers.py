@@ -210,6 +210,7 @@ class CondRCUBlock(nn.Module):
 
     for i in range(n_blocks):
       for j in range(n_stages):
+        print(features,num_classes)
         setattr(self, '{}_{}_norm'.format(i + 1, j + 1), normalizer(features, num_classes, bias=True))
         setattr(self, '{}_{}_conv'.format(i + 1, j + 1), ncsn_conv3x3(features, features, stride=1, bias=False))
 
@@ -404,7 +405,7 @@ class ConditionalResidualBlock(nn.Module):
     self.resample = resample
     self.normalization = normalization
     if resample == 'down':
-      if dilation > 1:
+      if dilation is not None and dilation > 1:
         self.conv1 = ncsn_conv3x3(input_dim, input_dim, dilation=dilation)
         self.normalize2 = normalization(input_dim, num_classes)
         self.conv2 = ncsn_conv3x3(input_dim, output_dim, dilation=dilation)
@@ -416,7 +417,7 @@ class ConditionalResidualBlock(nn.Module):
         conv_shortcut = partial(ConvMeanPool, kernel_size=1, adjust_padding=adjust_padding)
 
     elif resample is None:
-      if dilation > 1:
+      if dilation is not None and dilation > 1:
         conv_shortcut = partial(ncsn_conv3x3, dilation=dilation)
         self.conv1 = ncsn_conv3x3(input_dim, output_dim, dilation=dilation)
         self.normalize2 = normalization(output_dim, num_classes)

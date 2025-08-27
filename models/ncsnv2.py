@@ -20,8 +20,14 @@ import torch.nn as nn
 import functools
 
 from .utils import get_sigmas, register_model
-from .layers import (CondRefineBlock, RefineBlock, ResidualBlock, ncsn_conv3x3,
+#from .layers import (CondRefineBlock, RefineBlock, ResidualBlock, #ncsn_conv3x3,
+#                     ConditionalResidualBlock, get_act)
+
+from .layers import (CondRefineBlock, #ncsn_conv3x3,
                      ConditionalResidualBlock, get_act)
+from .layers_old import (ncsn_conv3x3, RefineBlock, ResidualBlock)
+
+
 from .normalization import get_normalization
 
 CondResidualBlock = ConditionalResidualBlock
@@ -44,6 +50,8 @@ def get_network(config):
 class NCSNv2(nn.Module):
   def __init__(self, config):
     super().__init__()
+    print('layers old')
+
     self.centered = config.data.centered
     self.norm = get_normalization(config)
     self.nf = nf = config.model.nf
@@ -52,10 +60,10 @@ class NCSNv2(nn.Module):
     self.register_buffer('sigmas', torch.tensor(get_sigmas(config)))
     self.config = config
 
-    self.begin_conv = nn.Conv2d(config.data.channels, nf, 3, stride=1, padding=1)
+    self.begin_conv = nn.Conv2d(config.data.num_channels, nf, 3, stride=1, padding=1)
 
     self.normalizer = self.norm(nf, config.model.num_scales)
-    self.end_conv = nn.Conv2d(nf, config.data.channels, 3, stride=1, padding=1)
+    self.end_conv = nn.Conv2d(nf, config.data.num_channels, 3, stride=1, padding=1)
 
     self.res1 = nn.ModuleList([
       ResidualBlock(self.nf, self.nf, resample=None, act=act,
@@ -124,9 +132,13 @@ class NCSNv2(nn.Module):
     output = self.normalizer(output)
     output = self.act(output)
     output = self.end_conv(output)
-
+    #print('y ', y)
+    #print(self.sigmas)
+    #print(self.sigmas[y])
     used_sigmas = self.sigmas[y].view(x.shape[0], *([1] * len(x.shape[1:])))
-
+    #print(used_sigmas)
+    #print(used_sigmas.shape)
+    #print(output.shape)
     output = output / used_sigmas
 
     return output
@@ -142,10 +154,10 @@ class NCSN(nn.Module):
     self.act = act = get_act(config)
     self.config = config
 
-    self.begin_conv = nn.Conv2d(config.data.channels, nf, 3, stride=1, padding=1)
+    self.begin_conv = nn.Conv2d(config.data.num_channels, nf, 3, stride=1, padding=1)
 
     self.normalizer = self.norm(nf, config.model.num_scales)
-    self.end_conv = nn.Conv2d(nf, config.data.channels, 3, stride=1, padding=1)
+    self.end_conv = nn.Conv2d(nf, config.data.num_channels, 3, stride=1, padding=1)
 
     self.res1 = nn.ModuleList([
       ConditionalResidualBlock(self.nf, self.nf, config.model.num_scales, resample=None, act=act,
