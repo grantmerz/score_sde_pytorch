@@ -207,42 +207,43 @@ def get_mixture_conditional_sampler(sde,
     eps: A `float` number. The SDE/ODE will be integrated to `eps` to avoid numerical issues.
   Returns: A pmapped class-conditional image sampler.
   """
-  # A function that gives the logits of the noise-dependent classifier
-  #logit_fn = mutils.get_logit_fn(classifier, classifier_params)
-  # The gradient function of the noise-dependent classifier
-  #@torch.enable_grad()
+  # We need the gradient of the reconstruction loss (MSE) 
+  # Recon loss is computed between the mixture model and the input mixture (see eq 5 of https://arxiv.org/pdf/2002.07942) 
   def mixture_grad_fn(x1t, x2t, ve_noise_scale, mixed):
-    lambda_ = 1./(ve_noise_scale**2)
-    lam = lambda_[0]
-    with torch.enable_grad():
+    '''
+    Args:
+      x1t: Images sampled from the score-based model at step t, representing the first component of the mixture
+      x2t: Images sampled from the score-based model at step t, representing the second component of the mixture
+      ve_noise_scale: The noise scale that at the current step
+      mixed: The input mixture of images 
+    
+    Returns:
+      The gradient of the recon loss with respect to the input images
+    
+    '''
 
+    lambda_ = 1./(ve_noise_scale**2)
+    #lam = lambda_[0]
+
+    with torch.enable_grad():
       x1n = x1t.clone().detach().requires_grad_(True)
       x2n = x2t.clone().detach().requires_grad_(True)
         
       xs=[x1n,x2n]
+      #compute recon loss and gradient
       recon_loss = (torch.norm(torch.flatten(sum(xs) - mixed)) ** 2)
       recon_grads = torch.autograd.grad(recon_loss, xs)
       mult = torch.einsum ('i, ijkl -> ijkl', lambda_, recon_grads[0])
     
-    #mult = lam*(x1t + x2t - mixed)
-
     return mult
 
 
-
-  #classifier_grad_fn = mutils.get_classifier_grad_fn(logit_fn)
-  #mixture_grad_fn = get_mixture_grad_fn(x1, x2, ve_noise_scale, mixed)
-
   def conditional_predictor_update_fn(model, x1, x2, t, mixed):
-    """The predictor update function for class-conditional sampling."""
     score_fn = mutils.get_score_fn(sde, model, train=False,
                                    continuous=continuous)
 
-    
-
     def total_grad_fn(x1, t):
       ve_noise_scale = sde.marginal_prob(x1, t)[1]
-      #return score_fn(x, t) + classifier_grad_fn(x, ve_noise_scale, labels)
       return score_fn(x1, t) - mixture_grad_fn(x1,x2, ve_noise_scale, mixed)
 
 
@@ -253,10 +254,13 @@ def get_mixture_conditional_sampler(sde,
     return predictor_obj.update_fn(x1, t)
 
   def conditional_corrector_update_fn(model, x1t, x2t, t, mixed):
-    """The corrector update function for class-conditional sampling."""
+    """The corrector update function for mixture separation sampling."""
+    
+    #The score function (diffusion model) used as a prior
     score_fn = mutils.get_score_fn(sde, model, train=False,
                                    continuous=continuous)
-
+    
+    #Caculate the total gradient of log(p(xt|m))
     def total_grad_fn(x1t, t):
       ve_noise_scale = sde.marginal_prob(x1t, t)[1]
       return score_fn(x1t, t) - mixture_grad_fn(x1t, x2t, ve_noise_scale, mixed)
@@ -268,37 +272,29 @@ def get_mixture_conditional_sampler(sde,
     return corrector_obj.update_fn(x1t, t)
 
   def pc_mixture_sampler(model, mixture):
-    """Generate class-conditional samples with Predictor-Corrector (PC) samplers.
+    """Generate samples from a mixture with Predictor-Corrector (PC) samplers.
     Args:
-      rng: A JAX random state.
-      score_state: A `flax.struct.dataclass` object that represents the training state
-        of the score-based model.
-      labels: A JAX array of integers that represent the target label of each sample.
+      model: A score model.
+      mixture: A mixture, tensors consisting of two distinct images added together
     Returns:
-      Class-conditional samples.
+      Samples of the separated images
     """
     with torch.no_grad():
       shape = mixture.shape
-      #mask = get_mask(gray_scale_img)
       # Initial sample
       x1 = sde.prior_sampling(shape).to(mixture.device)
       x2 = sde.prior_sampling(shape).to(mixture.device)
 
-      #x1=nn.Parameter(torch.Tensor(shape).uniform_()).to(mixture.device)
-      #x2=nn.Parameter(torch.Tensor(shape).uniform_()).to(mixture.device)
-
       timesteps = torch.linspace(sde.T, eps, sde.N)
         
-      #Try sampling at only a fraction of the noise scales
-      #so that nsteps can be increased  
-       
+      #Try sampling at only a fraction of the noise scales so that nsteps can be increased.
+      #There is a trade-off between sampling at more noise scales and sampling more steps within a noise scale
+      
+      #Assuming the number of timesteps is large here (this is hard coded and could be adjusted)
       for i,ts in enumerate(timesteps[::111]):
-      #for i in range(sde.N):
-        #t = timesteps[i]
-        #vec_t = torch.ones(x1.shape[0], device=x1.device) * t
         vec_t = torch.ones(x1.shape[0], device=x1.device) * ts
 
-        #This does all updates for x1 at one noise scale, then all for x2.  Don't want that!
+        #This does all updates for x1 at one noise scale, then all for x2.  Don't want that if nsteps>1!
         #x1c, x1_mean = conditional_corrector_update_fn(model, x1, x2, vec_t, mixture)
         #x2c, x2_mean = conditional_corrector_update_fn(model, x2, x1, vec_t, mixture)
         
@@ -308,34 +304,12 @@ def get_mixture_conditional_sampler(sde,
           x2_0 = x2
           x1, x1_mean = conditional_corrector_update_fn(model, x1_0, x2_0, vec_t, mixture)
           x2, x2_mean = conditional_corrector_update_fn(model, x2_0, x1_0, vec_t, mixture)
-          
-          #x1 = torch.clamp(x1, 0, 1)
-          #x2 = torch.clamp(x2, 0, 1)
-          #x1_mean = torch.clamp(x1_mean, 0, 1)
-          #x2_mean = torch.clamp(x2_mean, 0, 1)
-
-          #x1, x1_mean = conditional_predictor_update_fn(model, x1c, x2c, vec_t, mixture)
-          #x2, x2_mean = conditional_predictor_update_fn(model, x2c, x1c, vec_t, mixture)
-
-          #x1 = torch.clamp(x1, 0, 1)
-          #x2 = torch.clamp(x2, 0, 1)
-          #x1_mean = torch.clamp(x1_mean, 0, 1)
-          #x2_mean = torch.clamp(x2_mean, 0, 1)
-
-        #x1c = torch.clamp(x1c, 0, 1)
-        #x2c = torch.clamp(x2c, 0, 1)
-
+        
 
         x1c = x1
         x2c = x2
         x1, x1_mean = conditional_predictor_update_fn(model, x1c, x2c, vec_t, mixture)
         x2, x2_mean = conditional_predictor_update_fn(model, x2c, x1c, vec_t, mixture)
-
-        #x1 = torch.clamp(x1, 0, 1)
-        #x1_mean = torch.clamp(x1_mean,0,1)
-        #x2 = torch.clamp(x2, 0, 1)
-        #x2_mean = torch.clamp(x2_mean,0,1)
-
 
       return inverse_scaler(x1_mean if denoise else x1), inverse_scaler(x2_mean if denoise else x2)
 
